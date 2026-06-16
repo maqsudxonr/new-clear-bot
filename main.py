@@ -17,10 +17,20 @@ import asyncio
 import logging
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
+# Windows consoles default to a legacy codepage (e.g. cp1251) that can't encode
+# emoji or some Cyrillic, which would crash logging when we log post snippets.
+# Force UTF-8 on stdout/stderr so the bot never dies on a Unicode log line.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from anthropic import AsyncAnthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
@@ -218,12 +228,17 @@ bot_app.add_handler(CallbackQueryHandler(handle_callback))
 # Telethon client (reads the source channels using YOUR account)
 # ---------------------------------------------------------------------------
 
-tg_client = TelegramClient("session_name", TELEGRAM_API_ID, TELEGRAM_API_HASH)
+# NOTE: the TelegramClient is created inside main() rather than at import time.
+# On Python 3.14, instantiating it at module level raises "no running event loop"
+# because Telethon grabs the loop in __init__ and 3.14 no longer auto-creates one
+# outside an async context.
+
+# How often (seconds) to poll the source channels for new posts.
+POLL_INTERVAL_SECONDS = 30
 
 
-@tg_client.on(events.NewMessage(chats=SOURCE_CHANNELS))
-async def on_new_post(event):
-    message = event.message
+async def process_message(tg_client, message):
+    """Translate a single source-channel message and send it for approval."""
     text = message.message or ""
 
     log.info("New post from source channel: %s", (text[:60] + "...") if text else "[media only]")
@@ -260,6 +275,40 @@ async def on_new_post(event):
         )
 
 
+async def poll_sources(tg_client, source_entities, last_ids):
+    """Poll each source channel for messages newer than the last one we saw.
+
+    We poll instead of using events.NewMessage because user-account clients do
+    not reliably receive real-time updates for *broadcast* channels (read-only
+    channels like these). Polling get_messages is reliable for that channel type.
+    """
+    while True:
+        for ent in source_entities:
+            try:
+                # Newest first; min_id excludes everything we've already handled.
+                new_msgs = await tg_client.get_messages(
+                    ent, min_id=last_ids[ent.id], limit=50
+                )
+            except Exception:
+                log.exception("Failed to poll channel id=%s", ent.id)
+                continue
+
+            if not new_msgs:
+                continue
+
+            # Process oldest -> newest so approvals arrive in chronological order.
+            for message in reversed(new_msgs):
+                if message.id <= last_ids[ent.id]:
+                    continue
+                try:
+                    await process_message(tg_client, message)
+                except Exception:
+                    log.exception("Failed to process message id=%s", message.id)
+                last_ids[ent.id] = max(last_ids[ent.id], message.id)
+
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -272,12 +321,31 @@ async def main():
     await bot_app.updater.start_polling()
     log.info("Approval bot is polling for button presses...")
 
+    tg_client = TelegramClient("session_name", TELEGRAM_API_ID, TELEGRAM_API_HASH)
     await tg_client.start(phone=TELEGRAM_PHONE)
-    log.info("Listening to source channels: %s", SOURCE_CHANNELS)
+
+    # Resolve the source channels to concrete entities, and seed each channel's
+    # "last seen" id with its current newest message so we only forward NEW posts
+    # from now on (not the existing backlog).
+    source_entities = []
+    last_ids = {}
+    for name in SOURCE_CHANNELS:
+        try:
+            ent = await tg_client.get_entity(name)
+            source_entities.append(ent)
+            latest = await tg_client.get_messages(ent, limit=1)
+            last_ids[ent.id] = latest[0].id if latest else 0
+            log.info("Watching source channel %s -> id=%s title=%r (from msg id %s)",
+                     name, ent.id, getattr(ent, "title", "?"), last_ids[ent.id])
+        except Exception:
+            log.exception("Could not resolve source channel %s", name)
+
+    log.info("Polling %d source channel(s) every %ds", len(source_entities), POLL_INTERVAL_SECONDS)
 
     try:
-        await tg_client.run_until_disconnected()
+        await poll_sources(tg_client, source_entities, last_ids)
     finally:
+        await tg_client.disconnect()
         await bot_app.updater.stop()
         await bot_app.stop()
         await bot_app.shutdown()
